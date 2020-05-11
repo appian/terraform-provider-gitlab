@@ -3,6 +3,7 @@ package gitlab
 import (
 	"fmt"
 	"log"
+	"strconv"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-sdk/helper/resource"
@@ -34,6 +35,11 @@ var resourceGitLabProjectSchema = map[string]*schema.Schema{
 	"description": {
 		Type:     schema.TypeString,
 		Optional: true,
+	},
+	"forked_from_project_id": {
+		Type:          schema.TypeInt,
+		Optional:      true,
+		ConflictsWith: []string{"initialize_with_readme"},
 	},
 	"default_branch": {
 		Type:     schema.TypeString,
@@ -214,6 +220,11 @@ func resourceGitlabProjectSetToState(d *schema.ResourceData, project *gitlab.Pro
 	d.Set("name", project.Name)
 	d.Set("path", project.Path)
 	d.Set("description", project.Description)
+	if project.ForkedFromProject != nil {
+		d.Set("forked_from_project_id", project.ForkedFromProject.ID)
+	} else {
+		d.Set("forked_from_project_id", nil)
+	}
 	d.Set("default_branch", project.DefaultBranch)
 	d.Set("request_access_enabled", project.RequestAccessEnabled)
 	d.Set("issues_enabled", project.IssuesEnabled)
@@ -264,8 +275,48 @@ func resourceGitlabProjectCreate(d *schema.ResourceData, meta interface{}) error
 
 	// need to manage partial state since project creation may require
 	// more than a single API call, and they may all fail independently;
-	// the default set of attributes is prepopulated with those used above
 	d.Partial(true)
+
+	if forkedFromProjectID, isForked := d.GetOk("forked_from_project_id"); isForked {
+		err := forkProject(d, meta, forkedFromProjectID.(int))
+		if err != nil {
+			return err
+		}
+
+		// Wait for the project to be created.
+		// Forking a project in gitlab is async.
+		stateConf := &resource.StateChangeConf{
+			// Status options taken from https://docs.gitlab.com/ee/api/project_import_export.html#import-status
+			Pending: []string{
+				"none",
+				"scheduled",
+				"started",
+			},
+			Target: []string{
+				"finished",
+			},
+			Refresh: func() (interface{}, string, error) {
+				out, _, err := client.Projects.GetProject(d.Id(), nil)
+				if err != nil {
+					log.Printf("[ERROR] Received error: %#v", err)
+					return out, "Error", err
+				}
+				return out, out.ImportStatus, nil
+			},
+
+			Timeout:    10 * time.Minute,
+			MinTimeout: 3 * time.Second,
+			Delay:      5 * time.Second,
+		}
+
+		_, err = stateConf.WaitForState()
+		if err != nil {
+			return err
+		}
+
+		return resourceGitlabProjectUpdate(d, meta)
+	}
+
 	setProperties := []string{
 		"name",
 		"request_access_enabled",
@@ -391,7 +442,10 @@ func resourceGitlabProjectUpdate(d *schema.ResourceData, meta interface{}) error
 		updatedProperties = append(updatedProperties, "path")
 	}
 
-	if d.HasChange("namespace_id") {
+	// The transfer project api call will fail when passing in the namespace id
+	// the project is currently in. This occurs when we create a project via forking,
+	// so stop the transfer project function from being called for new resources
+	if d.HasChange("namespace_id") && !d.IsNewResource() {
 		transferOptions.Namespace = gitlab.Int(d.Get("namespace_id").(int))
 		updatedProperties = append(updatedProperties, "namespace_id")
 	}
@@ -535,6 +589,34 @@ func resourceGitlabProjectUpdate(d *schema.ResourceData, meta interface{}) error
 		d.SetPartial("archived")
 	}
 
+	if d.HasChange("forked_from_project_id") {
+		projectID, err := strconv.Atoi(d.Id())
+		if err != nil {
+			return err
+		}
+		if v, ok := d.GetOk("forked_from_project_id"); ok {
+			log.Printf("[DEBUG] updating project %s forked_from_project to %d", d.Id(), v.(int))
+			// Delete the existing fork relation before creating a new one.
+			// If no fork relationship exists, no error is thrown
+			_, err := client.Projects.DeleteProjectForkRelation(projectID)
+			if err != nil {
+				log.Printf("[WARN] Project (%s) could not delete fork relationship: error %#v", d.Id(), err)
+				return err
+			}
+			if _, _, err := client.Projects.CreateProjectForkRelation(projectID, v.(int)); err != nil {
+				log.Printf("[WARN] Project (%s) could not create a fork relationship with project %d: error %#v", d.Id(), v.(int), err)
+				return err
+			}
+		} else {
+			log.Printf("[DEBUG] deleting project %s forked_from_project_id", d.Id())
+			if _, err := client.Projects.DeleteProjectForkRelation(projectID); err != nil {
+				log.Printf("[WARN] Project (%s) could not delete fork relationship: error %#v", d.Id(), err)
+				return err
+			}
+		}
+		d.SetPartial("forked_from_project_id")
+	}
+
 	d.Partial(false)
 	return resourceGitlabProjectRead(d, meta)
 }
@@ -578,6 +660,45 @@ func resourceGitlabProjectDelete(d *schema.ResourceData, meta interface{}) error
 	if err != nil {
 		return fmt.Errorf("error waiting for project (%s) to become deleted: %s", d.Id(), err)
 	}
+	return nil
+}
+
+func forkProject(d *schema.ResourceData, meta interface{}, forkedFromProjectID int) error {
+	client := meta.(*gitlab.Client)
+
+	setProperties := []string{
+		"name",
+		"forked_from_project_id",
+	}
+
+	options := &gitlab.ForkProjectOptions{
+		Name: gitlab.String(d.Get("name").(string)),
+	}
+
+	if v, ok := d.GetOk("path"); ok {
+		options.Path = gitlab.String(v.(string))
+		setProperties = append(setProperties, "path")
+	}
+
+	if v, ok := d.GetOk("namespace_id"); ok {
+		options.Namespace = gitlab.String(strconv.Itoa(v.(int)))
+		setProperties = append(setProperties, "namespace_id")
+	}
+
+	project, _, err := client.Projects.ForkProject(strconv.Itoa(forkedFromProjectID), options)
+	if err != nil {
+		return err
+	}
+
+	// from this point onwards no matter how we return, resource creation
+	// is committed to state since we set its ID
+	d.SetId(fmt.Sprintf("%d", project.ID))
+
+	for _, setProperty := range setProperties {
+		log.Printf("[DEBUG] partial gitlab project %s creation of property %q", d.Id(), setProperty)
+		d.SetPartial(setProperty)
+	}
+
 	return nil
 }
 
