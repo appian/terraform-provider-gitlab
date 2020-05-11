@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-sdk/helper/resource"
@@ -40,6 +41,11 @@ var resourceGitLabProjectSchema = map[string]*schema.Schema{
 	"description": {
 		Type:     schema.TypeString,
 		Optional: true,
+	},
+	"forked_from_project_id": {
+		Type:          schema.TypeInt,
+		Optional:      true,
+		ConflictsWith: []string{"initialize_with_readme"},
 	},
 	"default_branch": {
 		Type:     schema.TypeString,
@@ -316,6 +322,11 @@ func resourceGitlabProjectSetToState(d *schema.ResourceData, project *gitlab.Pro
 	d.Set("path", project.Path)
 	d.Set("path_with_namespace", project.PathWithNamespace)
 	d.Set("description", project.Description)
+	if project.ForkedFromProject != nil {
+		d.Set("forked_from_project_id", project.ForkedFromProject.ID)
+	} else {
+		d.Set("forked_from_project_id", nil)
+	}
 	d.Set("default_branch", project.DefaultBranch)
 	d.Set("request_access_enabled", project.RequestAccessEnabled)
 	d.Set("issues_enabled", project.IssuesEnabled)
@@ -520,7 +531,10 @@ func resourceGitlabProjectUpdate(d *schema.ResourceData, meta interface{}) error
 		options.Path = gitlab.String(d.Get("path").(string))
 	}
 
-	if d.HasChange("namespace_id") {
+	// The transfer project api call will fail when passing in the namespace id
+	// the project is currently in. This occurs when we create a project via forking,
+	// so stop the transfer project function from being called for new resources
+	if d.HasChange("namespace_id") && !d.IsNewResource() {
 		transferOptions.Namespace = gitlab.Int(d.Get("namespace_id").(int))
 	}
 
@@ -672,6 +686,35 @@ func resourceGitlabProjectUpdate(d *schema.ResourceData, meta interface{}) error
 		}
 	}
 
+	if d.HasChange("forked_from_project_id") {
+		projectID, err := strconv.Atoi(d.Id())
+		if err != nil {
+			return err
+		}
+		if v, ok := d.GetOk("forked_from_project_id"); ok {
+			log.Printf("[DEBUG] updating project %s forked_from_project to %d", d.Id(), v.(int))
+			// Delete the existing fork relation before creating a new one.
+			// If no fork relationship exists, no error is thrown
+			_, err := client.Projects.DeleteProjectForkRelation(projectID)
+			if err != nil {
+				log.Printf("[WARN] Project (%s) could not delete fork relationship: error %#v", d.Id(), err)
+				return err
+			}
+			if _, _, err := client.Projects.CreateProjectForkRelation(projectID, v.(int)); err != nil {
+				log.Printf("[WARN] Project (%s) could not create a fork relationship with project %d: error %#v", d.Id(), v.(int), err)
+				return err
+			}
+		} else {
+			log.Printf("[DEBUG] deleting project %s forked_from_project_id", d.Id())
+			if _, err := client.Projects.DeleteProjectForkRelation(projectID); err != nil {
+				log.Printf("[WARN] Project (%s) could not delete fork relationship: error %#v", d.Id(), err)
+				return err
+			}
+		}
+		d.SetPartial("forked_from_project_id")
+	}
+
+	d.Partial(false)
 	return resourceGitlabProjectRead(d, meta)
 }
 
@@ -740,6 +783,45 @@ func editOrAddPushRules(client *gitlab.Client, projectID string, d *schema.Resou
 	_, _, err = client.Projects.AddProjectPushRule(projectID, addOptions)
 	if err != nil {
 		return err
+	}
+
+	return nil
+}
+
+func forkProject(d *schema.ResourceData, meta interface{}, forkedFromProjectID int) error {
+	client := meta.(*gitlab.Client)
+
+	setProperties := []string{
+		"name",
+		"forked_from_project_id",
+	}
+
+	options := &gitlab.ForkProjectOptions{
+		Name: gitlab.String(d.Get("name").(string)),
+	}
+
+	if v, ok := d.GetOk("path"); ok {
+		options.Path = gitlab.String(v.(string))
+		setProperties = append(setProperties, "path")
+	}
+
+	if v, ok := d.GetOk("namespace_id"); ok {
+		options.Namespace = gitlab.String(strconv.Itoa(v.(int)))
+		setProperties = append(setProperties, "namespace_id")
+	}
+
+	project, _, err := client.Projects.ForkProject(strconv.Itoa(forkedFromProjectID), options)
+	if err != nil {
+		return err
+	}
+
+	// from this point onwards no matter how we return, resource creation
+	// is committed to state since we set its ID
+	d.SetId(fmt.Sprintf("%d", project.ID))
+
+	for _, setProperty := range setProperties {
+		log.Printf("[DEBUG] partial gitlab project %s creation of property %q", d.Id(), setProperty)
+		d.SetPartial(setProperty)
 	}
 
 	return nil
