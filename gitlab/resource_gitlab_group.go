@@ -168,6 +168,7 @@ func resourceGitlabGroupRead(d *schema.ResourceData, meta interface{}) error {
 	d.Set("project_creation_level", group.ProjectCreationLevel)
 	d.Set("parent_id", group.ParentID)
 	d.Set("runners_token", group.RunnersToken)
+	d.Set("project_creation_level", group.ProjectCreationLevel)
 
 	return nil
 }
