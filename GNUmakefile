@@ -19,7 +19,7 @@ testacc-cleanenv:
 	docker stop gitlab
 
 testacc: fmtcheck
-	TF_ACC=1 go test -v $(TEST) $(TESTARGS) -timeout 40m
+	TF_ACC=1 go test $(TEST) -v $(TESTARGS) -timeout 120m
 
 vet:
 	@echo "go vet ."

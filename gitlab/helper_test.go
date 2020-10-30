@@ -28,6 +28,18 @@ func testAccCompareGitLabAttribute(attr string, expected, received *schema.Resou
 	return nil
 }
 
+func testAccIsSkippedAttribute(needle string, haystack []string) bool {
+	if needle != "" {
+		for _, hay := range haystack {
+			if hay == needle {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 // Returns true if the acceptance test is running Gitlab EE.
 // Meant to be used as SkipFunc to skip tests that work only on Gitlab CE.
 func isRunningInEE() (bool, error) {
