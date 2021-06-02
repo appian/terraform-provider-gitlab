@@ -383,6 +383,45 @@ func resourceGitlabProjectCreate(d *schema.ResourceData, meta interface{}) error
 		MirrorTriggerBuilds:                       gitlab.Bool(d.Get("mirror_trigger_builds").(bool)),
 	}
 
+	// need to manage partial state since project creation may require
+	// more than a single API call, and they may all fail independently;
+	d.Partial(true)
+	if forkedFromProjectID, isForked := d.GetOk("forked_from_project_id"); isForked {
+		err := forkProject(d, meta, forkedFromProjectID.(int))
+		if err != nil {
+			return err
+		}
+		// Wait for the project to be created.
+		// Forking a project in gitlab is async.
+		stateConf := &resource.StateChangeConf{
+			// Status options taken from https://docs.gitlab.com/ee/api/project_import_export.html#import-status
+			Pending: []string{
+				"none",
+				"scheduled",
+				"started",
+			},
+			Target: []string{
+				"finished",
+			},
+			Refresh: func() (interface{}, string, error) {
+				out, _, err := client.Projects.GetProject(d.Id(), nil)
+				if err != nil {
+					log.Printf("[ERROR] Received error: %#v", err)
+					return out, "Error", err
+				}
+				return out, out.ImportStatus, nil
+			},
+			Timeout:    10 * time.Minute,
+			MinTimeout: 3 * time.Second,
+			Delay:      5 * time.Second,
+		}
+		_, err = stateConf.WaitForState()
+		if err != nil {
+			return err
+		}
+		return resourceGitlabProjectUpdate(d, meta)
+	}
+
 	if v, ok := d.GetOk("path"); ok {
 		options.Path = gitlab.String(v.(string))
 	}
@@ -483,6 +522,9 @@ func resourceGitlabProjectCreate(d *schema.ResourceData, meta interface{}) error
 	// set in a second call after project creation.
 	resourceGitlabProjectUpdate(d, meta)
 
+	// everything went OK, we can revert to ordinary state management
+	// and let the Gitlab server fill in the resource state via a read
+	d.Partial(false)
 	return resourceGitlabProjectRead(d, meta)
 }
 
